@@ -4,7 +4,7 @@ import numpy as np
 import pandas as pd
 from dask_ml.preprocessing import Categorizer
 from glum import GeneralizedLinearRegressor, TweedieDistribution
-from lightgbm import LGBMRegressor
+from lightgbm import LGBMRegressor, plot_metric
 from sklearn.compose import ColumnTransformer
 from sklearn.metrics import auc
 from sklearn.model_selection import GridSearchCV
@@ -108,7 +108,7 @@ model_pipeline
 # let's check that the transforms worked
 model_pipeline[:-1].fit_transform(df_train)
 
-model_pipeline.fit(df_train, y_train_t, estimate__sample_weight=w_train_t)
+model_pipeline.fit(df_train, y_train_t, estimator__sample_weight=w_train_t)
 
 pd.DataFrame(
     {
@@ -225,6 +225,24 @@ print(
         np.sum(df["Exposure"].values[test] * df_test["pp_t_lgbm"]),
     )
 )
+
+#%%
+#TODO:Track learning curves: Based on the cross-validated constrained LGBMRegressor object,
+# plot a learning curve which is showing the convergence of the score on the train and test set.
+
+best_constrained = cv.best_estimator_ #this is the best estimator from the grid search
+
+best_constrained.fit(
+    X_train_t, y_train_t,
+    estimate__sample_weight=w_train_t,
+    estimate__eval_set=[(X_train_t, y_train_t), (X_test_t, y_test_t)],
+    estimate__eval_sample_weight=[w_train_t, w_test_t],  # weight eval by exposure too
+    estimate__eval_names=["train", "test"],
+) 
+
+plot_metric(best_constrained[-1])
+plt.show()
+# Graph shows that the training loss is decreasing, but the test loss is increasing. Gaps are widdening. This is a sign of overfitting.
 # %%
 # Let's compare the sorting of the pure premium predictions
 
