@@ -5,12 +5,14 @@ import pandas as pd
 from dask_ml.preprocessing import Categorizer
 from glum import GeneralizedLinearRegressor, TweedieDistribution
 from lightgbm import LGBMRegressor, plot_metric
+from sklearn.base import clone
 from sklearn.compose import ColumnTransformer
 from sklearn.metrics import auc, make_scorer, mean_tweedie_deviance
 from sklearn.model_selection import GridSearchCV
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import OneHotEncoder, SplineTransformer, StandardScaler
 from ps3.data import create_sample_split, load_transform
+from ps3.evaluation import evaluate_predictions
 
 # %% 
 # load data from openml
@@ -133,7 +135,9 @@ preprocessor = ColumnTransformer(
 )
 preprocessor.set_output(transform="pandas")
 model_pipeline = Pipeline(
-    steps=[("preprocessor", preprocessor), ("estimator", t_glm1)]
+    # clone: use a fresh copy, otherwise fitting the pipeline re-fits t_glm1 in place
+    # on the spline features and the initial GLM is lost
+    steps=[("preprocessor", preprocessor), ("estimator", clone(t_glm1))]
 )
 
 # let's have a look at the pipeline
@@ -262,7 +266,9 @@ cv = GridSearchCV(
     model_pipeline,
     param_grid,
     cv=5,
-    scoring=make_scorer(mean_tweedie_deviance, power=1.5),
+    # greater_is_better=False: GridSearchCV maximises the score, so the deviance
+    # must be negated to pick the model with the LOWEST deviance.
+    scoring=make_scorer(mean_tweedie_deviance, power=1.5, greater_is_better=False),
     verbose=1,
 )
 cv.fit(X_train_t, y_train_t, estimate__sample_weight=w_train_t)
@@ -291,11 +297,41 @@ print(
     )
 )
 
+# %%
+# Tune the constrained LGBM with the same grid, so both LGBMs are compared fairly.
+cv_constrained = GridSearchCV(
+    constrained_lgbm,
+    param_grid,
+    cv=5,
+    scoring=make_scorer(mean_tweedie_deviance, power=1.5, greater_is_better=False),
+    verbose=1,
+)
+cv_constrained.fit(X_train_t, y_train_t, estimate__sample_weight=w_train_t)
+print("best params constrained_lgbm:", cv_constrained.best_params_)
+
+df_test["pp_t_lgbm_constrained"] = cv_constrained.best_estimator_.predict(X_test_t)
+df_train["pp_t_lgbm_constrained"] = cv_constrained.best_estimator_.predict(X_train_t)
+
+print(
+    "training loss constrained_lgbm (tuned):",
+    TweedieDist.deviance(
+        y_train_t, df_train["pp_t_lgbm_constrained"], sample_weight=w_train_t
+    )
+    / np.sum(w_train_t),
+)
+print(
+    "testing loss constrained_lgbm (tuned):",
+    TweedieDist.deviance(
+        y_test_t, df_test["pp_t_lgbm_constrained"], sample_weight=w_test_t
+    )
+    / np.sum(w_test_t),
+)
+
 #%%
 #TODO:Track learning curves: Based on the cross-validated constrained LGBMRegressor object,
 # plot a learning curve which is showing the convergence of the score on the train and test set.
 
-best_constrained = cv.best_estimator_ #this is the best estimator from the grid search
+best_constrained = cv_constrained.best_estimator_  # best constrained LGBM from the grid search
 
 best_constrained.fit(
     X_train_t, y_train_t,
@@ -308,6 +344,26 @@ best_constrained.fit(
 plot_metric(best_constrained[-1])
 plt.show()
 # Graph shows that the training loss is decreasing, but the test loss is increasing. Gaps are widdening. This is a sign of overfitting.
+
+# %%
+# Compare the constrained and unconstrained LGBM on the test set
+model_comparison = pd.concat(
+    [
+        evaluate_predictions(
+            df_test["PurePremium"],
+            df_test[col],
+            sample_weight=df_test["Exposure"],
+            model_name=name,
+        )
+        for name, col in [
+            ("LGBM", "pp_t_lgbm"),
+            ("LGBM constrained", "pp_t_lgbm_constrained"),
+        ]
+    ],
+    axis=1,
+)
+print(model_comparison)
+
 # %%
 # Let's compare the sorting of the pure premium predictions
 
@@ -358,5 +414,80 @@ ax.set(
 )
 ax.legend(loc="upper left")
 plt.plot()
+
+# %%
+# Ex 4: Partial dependence plots (PDPs) with DALEX
+# Compare how each feature drives the predictions of the unconstrained and the
+# constrained LGBM (marginal effect, averaged over the test set).
+import dalex as dx
+
+explainer_lgbm = dx.Explainer(
+    cv.best_estimator_, X_test_t, y_test_t, label="LGBM", verbose=False
+)
+explainer_lgbm_constrained = dx.Explainer(
+    best_constrained, X_test_t, y_test_t, label="LGBM constrained", verbose=False
+)
+
+numerical_features = ["BonusMalus", "Density"]
+
+# PDPs of the numerical features
+pdp_num = explainer_lgbm.model_profile(
+    variables=numerical_features, type="partial", random_state=42, verbose=False
+)
+pdp_num_constrained = explainer_lgbm_constrained.model_profile(
+    variables=numerical_features, type="partial", random_state=42, verbose=False
+)
+pdp_num_constrained.plot(pdp_num, title="PDPs numerical features")
+
+# PDPs of the categorical features
+pdp_cat = explainer_lgbm.model_profile(
+    variables=categoricals,
+    variable_type="categorical",
+    type="partial",
+    random_state=42,
+    verbose=False,
+)
+pdp_cat_constrained = explainer_lgbm_constrained.model_profile(
+    variables=categoricals,
+    variable_type="categorical",
+    type="partial",
+    random_state=42,
+    verbose=False,
+)
+pdp_cat_constrained.plot(pdp_cat, title="PDPs categorical features")
+
+# Interpretation: the constrained LGBM's PDP for BonusMalus increases monotonically,
+# whereas the unconstrained one can go down in sparse, high-BonusMalus regions.
+# The PDPs of the other features are very similar for both models.
+
+# %%
+# Ex 5: Decompose a single prediction with SHAP (DALEX predict_parts)
+# Compare how the initial GLM and the constrained LGBM build up the prediction
+# for one specific policy: the first row of the test set.
+explainer_glm = dx.Explainer(
+    t_glm1, X_test_t, y_test_t, label="GLM Benchmark", verbose=False
+)
+# explainer_lgbm_constrained was already defined for the PDPs above
+
+observation = X_test_t.iloc[[0]]
+
+shap_glm = explainer_glm.predict_parts(observation, type="shap", random_state=42)
+shap_lgbm_constrained = explainer_lgbm_constrained.predict_parts(
+    observation, type="shap", random_state=42
+)
+
+shap_glm.plot(shap_lgbm_constrained, title="SHAP decomposition: first test row")
+
+# Side by side table of the feature contributions
+shap_comparison = pd.concat(
+    [
+        shap_glm.result.groupby("variable")["contribution"].mean().rename("GLM"),
+        shap_lgbm_constrained.result.groupby("variable")["contribution"]
+        .mean()
+        .rename("LGBM constrained"),
+    ],
+    axis=1,
+).sort_values("LGBM constrained", key=abs, ascending=False)
+print(shap_comparison)
 
 # %%
