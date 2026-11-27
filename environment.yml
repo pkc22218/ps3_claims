@@ -17,9 +17,13 @@ dependencies:
   - ydata-profiling
   # interactive
   - ipykernel
+  - nbformat  # needed by plotly to render DALEX plots in notebooks
   # plots
   - matplotlib
   # ml
   - glum
   - lightgbm
   - scikit-learn
+  # explainability: dalex>1.7.0 is needed for numpy>=2, but conda-forge only has 1.7.0
+  - pip:
+      - dalex>=1.8.0
