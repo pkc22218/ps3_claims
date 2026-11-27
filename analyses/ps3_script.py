@@ -36,6 +36,17 @@ df_test = df.iloc[test].copy()
 # Exposure-weighted average claims per BonusMalus group (training data only).
 # Weighted average = sum(ClaimAmountCut) / sum(Exposure) per BonusMalus level,
 # equivalent to np.average(PurePremium, weights=Exposure).
+
+"""
+In the French bonus-malus system, BonusMalus goes up when a driver has claims and goes down over claim-free years. A higher value should therefore never mean a lower risk.
+LightGBM fits whatever pattern is in the data. Without a constraint it will learn the noisy dips from Step 5, which means:
+The pricing is unfair and makes no sense. A driver with BM = 140 could be quoted less than a driver with BM = 120, so having more claims would make insurance cheaper.
+The model overfits. The dips come from a few policies in sparse cells, often a handful of policies with no claims. Learning them improves the training loss but hurts the test deviance and makes the model less stable.
+It weakens the incentive. The whole point of bonus-malus is to reward claim-free driving. A non-monotone tariff contradicts that.
+It's hard to defend to regulators and the business. Actuaries and regulators expect the tariff to make sense in a known direction, and a jagged curve is hard to justify.
+Small changes can flip predictions. A small change in the data, or a new random seed, can move where the dips fall and change prices between model versions.
+"""
+
 df_bm = (
     df_train.groupby("BonusMalus")
     .agg(claims=("ClaimAmountCut", "sum"), exposure=("Exposure", "sum"))
@@ -53,13 +64,6 @@ ax1.set_ylabel("Avg claim amount per unit exposure")
 ax2.set_ylabel("Total exposure (years)")
 ax1.set_title("Exposure-weighted average claims by BonusMalus")
 plt.show()
-
-# TODO: What will/could happen if we do not include a monotonicity constraint?
-# The plot rises with BonusMalus where exposure is large, but is very noisy for
-# BonusMalus > ~100 where exposure is thin. An unconstrained LGBM would learn these
-# dips, so a driver with a worse claims history could get a lower predicted premium:
-# unfair and counter-intuitive pricing, overfitting to sparse cells, weaker
-# bonus-malus incentives, and a tariff that is hard to justify to regulators.
 
 # %%
 categoricals = ["VehBrand", "VehGas", "Region", "Area", "DrivAge", "VehAge", "VehPower"]
@@ -208,6 +212,37 @@ print(
         / np.sum(w_test_t)
     )
 )
+
+#%% Model pipeline with monotonicity constraint
+# 1 for BonusMalus, 0 for every other feature, in X_train_t's column order
+monotone = [1 if col == "BonusMalus" else 0 for col in X_train_t.columns]
+
+constrained_lgbm = Pipeline(
+    steps =[
+        ("estimate", LGBMRegressor(
+            objective="tweedie",
+            tweedie_variance_power=1.5,
+            random_state=42,
+            monotone_constraints=monotone,
+        ))
+    ]
+)
+
+constrained_lgbm.fit(X_train_t, y_train_t, estimate__sample_weight=w_train_t)
+df_test["pp_t_lgbm_constrained"] = constrained_lgbm.predict(X_test_t)
+df_train["pp_t_lgbm_constrained"] = constrained_lgbm.predict(X_train_t)
+print(
+    "training loss constrained_lgbm:", 
+        TweedieDist.deviance(y_train_t, df_train["pp_t_lgbm_constrained"], 
+        sample_weight=w_train_t) / np.sum(w_train_t)
+    )
+
+print(
+    "testing loss constrained_lgbm:", 
+        TweedieDist.deviance(y_test_t, df_test["pp_t_lgbm_constrained"], 
+        sample_weight=w_test_t) / np.sum(w_test_t)
+    )
+
 
 # %%
 # TODO: Let's tune the LGBM to reduce overfitting.
